@@ -32,7 +32,10 @@ namespace WebcamControl
         public SoftAeDto Settings = SoftAeDto.Default();
 
         // Dependances fournies par le formulaire. Tout est appele sur le thread interface.
-        public Func<CameraSession> GetSession;
+        // WithCamera ouvre la camera, execute l'action, puis la relache aussitot :
+        // la garder ouverte empecherait le navigateur d'y acceder.
+        public Action<Action<CameraSession>> WithCamera;
+        public Func<bool> CameraKnown;
         public Func<ControlDef> GetExposureDef;
         public Func<ControlDef> GetGainDef;
         public Func<bool> PreviewRunning;
@@ -48,7 +51,16 @@ namespace WebcamControl
         bool primed;
         bool lastSeenInUse;
         DateTime lastPass = DateTime.MinValue;
+        DateTime freeSince = DateTime.MinValue;
         int settled;
+
+        // Delai de courtoisie apres qu'une autre application a relache la camera.
+        const int GraceAfterReleaseSeconds = 20;
+
+        // Duree maximale d'occupation de la camera pour une mesure. Chaque seconde
+        // compte : c'est autant de temps pendant lequel une autre application se
+        // verrait refuser l'acces.
+        const int PassSeconds = 4;
 
         PreviewStream pass;
         int passSamples;
@@ -62,23 +74,28 @@ namespace WebcamControl
         // Force l'exposition et le gain en manuel et memorise le point de depart.
         public void Prime()
         {
-            CameraSession s = GetSession != null ? GetSession() : null;
             ControlDef e = GetExposureDef != null ? GetExposureDef() : null;
             ControlDef g = GetGainDef != null ? GetGainDef() : null;
-            if (s == null || g == null) return;
+            if (WithCamera == null || g == null) return;
 
-            ControlState st;
-            currentGain = (Settings.GainMin + Settings.GainMax) / 2;
-            if (s.TryRead(g, out st)) currentGain = Clamp(st.Value, Settings.GainMin, Settings.GainMax);
-            s.Write(g, new ControlState(currentGain, false));
-
-            if (e != null)
+            bool done = false;
+            WithCamera(delegate(CameraSession s)
             {
-                currentExposure = (Settings.ExposureMin + Settings.ExposureMax) / 2;
-                if (s.TryRead(e, out st) && !st.Auto)
-                    currentExposure = Clamp(st.Value, Settings.ExposureMin, Settings.ExposureMax);
-                s.Write(e, new ControlState(currentExposure, false));   // jamais d'auto materiel
-            }
+                ControlState st;
+                currentGain = (Settings.GainMin + Settings.GainMax) / 2;
+                if (s.TryRead(g, out st)) currentGain = Clamp(st.Value, Settings.GainMin, Settings.GainMax);
+                s.Write(g, new ControlState(currentGain, false));
+
+                if (e != null)
+                {
+                    currentExposure = (Settings.ExposureMin + Settings.ExposureMax) / 2;
+                    if (s.TryRead(e, out st) && !st.Auto)
+                        currentExposure = Clamp(st.Value, Settings.ExposureMin, Settings.ExposureMax);
+                    s.Write(e, new ControlState(currentExposure, false));   // jamais d'auto materiel
+                }
+                done = true;
+            });
+            if (!done) return;
 
             primed = true;
             settled = 0;
@@ -89,7 +106,8 @@ namespace WebcamControl
         public void Tick()
         {
             if (!Settings.Enabled) return;
-            if (GetSession == null || GetSession() == null) return;
+            if (WithCamera == null) return;
+            if (CameraKnown != null && !CameraKnown()) return;
             if (!primed) Prime();
 
             bool ourPreview = PreviewRunning != null && PreviewRunning();
@@ -107,9 +125,16 @@ namespace WebcamControl
                 return;
             }
 
-            // La camera vient de se liberer : on remesure sans attendre le prochain cycle.
-            bool justFreed = lastSeenInUse;
-            lastSeenInUse = false;
+            // La camera vient de se liberer. On ne mesure surtout pas tout de suite :
+            // quitter une visioconference et en ouvrir une autre dans la foulee est
+            // courant, et une mesure a cet instant refuserait la camera a l'application
+            // suivante. On laisse donc passer un delai de courtoisie.
+            if (lastSeenInUse)
+            {
+                lastSeenInUse = false;
+                freeSince = DateTime.Now;
+            }
+            bool graceElapsed = (DateTime.Now - freeSince).TotalSeconds >= GraceAfterReleaseSeconds;
 
             if (ourPreview)
             {
@@ -121,8 +146,9 @@ namespace WebcamControl
 
             if (pass != null) { WatchPass(); return; }
 
-            if (justFreed || (DateTime.Now - lastPass).TotalSeconds >= Settings.IdleIntervalSeconds)
-                StartPass();
+            if (!Settings.MeterIdle) { Report("en veille : mesure seulement avec l'apercu ouvert"); return; }
+            if (!graceElapsed) return;
+            if ((DateTime.Now - lastPass).TotalSeconds >= Settings.IdleIntervalSeconds) StartPass();
         }
 
         public void MeasureNow()
@@ -155,8 +181,10 @@ namespace WebcamControl
             pass = new PreviewStream();
             pass.FrameReady += OnPassFrame;
             pass.Stopped += OnPassStopped;
-            // 15 i/s : c'est la cadence minimale acceptee par la N60 en 320x240.
-            pass.Start(ff, dev, 320, 240, 15);
+            // 15 i/s : cadence minimale acceptee par la N60 en 320x240. La duree
+            // limite fait sortir ffmpeg tout seul, ce qui rend la camera proprement
+            // meme si l'arret explicite echoue.
+            pass.Start(ff, dev, 320, 240, 15, PassSeconds);
             Report("mesure en cours...");
             if (Trace != null) Trace("AE passe de mesure demarree");
         }
@@ -182,13 +210,21 @@ namespace WebcamControl
             if (pass == null) return;
             passSamples++;
             Step(luma, Settings.IdleStepMax, false);
-            if (settled >= 2 || passSamples >= 16) StopPass();
+            if (settled >= 2 || passSamples >= 6) StopPass();
         }
 
         void WatchPass()
         {
-            // Filet de securite si ffmpeg ne rend jamais d'image exploitable.
-            if ((DateTime.Now - passStarted).TotalSeconds > 8) StopPass();
+            // Pendant une passe, la camera est reservee : toute autre application qui
+            // la demande se voit refuser. On abrege donc au moindre signe de
+            // concurrence, et on borne la duree dans tous les cas.
+            if (CameraUsage.InUseBy(FfmpegLeafName()) != null)
+            {
+                if (Trace != null) Trace("AE mesure abregee : une autre application demande la camera");
+                StopPass();
+                return;
+            }
+            if ((DateTime.Now - passStarted).TotalSeconds > 3) StopPass();
         }
 
         void OnPassStopped(string message)
@@ -226,8 +262,11 @@ namespace WebcamControl
             {
                 p.FrameReady -= OnPassFrame;
                 p.Stopped -= OnPassStopped;
-                // L'arret attend la fin du thread de lecture : on ne fige pas l'interface pour ca.
-                System.Threading.ThreadPool.QueueUserWorkItem(delegate { try { p.Dispose(); } catch { } });
+                // Liberation synchrone, volontairement. Passer par le pool de threads
+                // laissait le processus de mesure survivre, et tant qu'il vit la camera
+                // reste reservee : plus aucune autre application ne peut l'ouvrir.
+                try { p.Dispose(); }
+                catch (Exception ex) { if (Trace != null) Trace("AE liberation du flux : " + ex.Message); }
             }
         }
 
@@ -236,9 +275,8 @@ namespace WebcamControl
         // Renvoie true si une correction a ete appliquee.
         bool Step(double luma, int maxStep, bool live)
         {
-            CameraSession s = GetSession != null ? GetSession() : null;
             ControlDef g = GetGainDef != null ? GetGainDef() : null;
-            if (s == null || g == null) return false;
+            if (WithCamera == null || g == null) return false;
             if (!primed) Prime();
 
             double error = Settings.TargetLuma - luma;
@@ -258,7 +296,8 @@ namespace WebcamControl
             if (wanted != currentGain)
             {
                 currentGain = wanted;
-                s.Write(g, new ControlState(currentGain, false));
+                int g2 = currentGain;
+                WithCamera(delegate(CameraSession s) { s.Write(g, new ControlState(g2, false)); });
             }
             else
             {
@@ -279,8 +318,12 @@ namespace WebcamControl
                 }
                 currentExposure = newExposure;
                 currentGain = (Settings.GainMin + Settings.GainMax) / 2;
-                s.Write(e, new ControlState(currentExposure, false));
-                s.Write(g, new ControlState(currentGain, false));
+                int e2 = currentExposure, g3 = currentGain;
+                WithCamera(delegate(CameraSession s)
+                {
+                    s.Write(e, new ControlState(e2, false));
+                    s.Write(g, new ControlState(g3, false));
+                });
             }
 
             if (Applied != null) Applied(currentExposure, currentGain);

@@ -29,6 +29,11 @@ namespace WebcamControl
         [DataMember(Order = 7)] public int IdleIntervalSeconds;
         [DataMember(Order = 8)] public int LiveStepMax;
         [DataMember(Order = 9)] public int IdleStepMax;
+        // Nullable a dessein : un profil enregistre avant l'apparition de ce
+        // reglage doit hériter du defaut, pas de false.
+        [DataMember(Order = 10)] public bool? MeterWhenIdle;
+
+        public bool MeterIdle { get { return MeterWhenIdle ?? true; } }
 
         public static SoftAeDto Default()
         {
@@ -40,7 +45,10 @@ namespace WebcamControl
             d.GainMax = 75;              // au dela le bruit devient visible
             d.ExposureMin = -9;
             d.ExposureMax = -5;          // -4 et au dela saturent et font chuter la cadence
-            d.IdleIntervalSeconds = 180;
+            d.IdleIntervalSeconds = 300;
+            // Mesurer camera libre garde l'exposition juste tout au long de la
+            // journee, au prix d'environ trois secondes d'occupation par cycle.
+            d.MeterWhenIdle = true;
             d.LiveStepMax = 1;           // apercu ouvert : un cran, soit environ 2 %
             d.IdleStepMax = 8;           // personne ne regarde : on peut converger vite
             return d;
@@ -58,9 +66,10 @@ namespace WebcamControl
             if (GainMin < 0) GainMin = 0;
             if (GainMax <= GainMin) { GainMin = 5; GainMax = 75; }
             if (ExposureMax < ExposureMin) { ExposureMin = -9; ExposureMax = -5; }
-            if (IdleIntervalSeconds < 15) IdleIntervalSeconds = 180;
+            if (IdleIntervalSeconds < 15) IdleIntervalSeconds = 300;
             if (LiveStepMax < 1) LiveStepMax = 1;
             if (IdleStepMax < 1) IdleStepMax = 8;
+            if (MeterWhenIdle == null) MeterWhenIdle = true;
         }
     }
 

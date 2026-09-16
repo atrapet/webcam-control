@@ -27,15 +27,25 @@ namespace WebcamControl
 
         // Parametres du dernier demarrage, pour pouvoir retenter sans format impose.
         string lastFfmpeg, lastDevice;
-        int lastWidth, lastHeight, lastFps;
+        int lastWidth, lastHeight, lastFps, lastMaxSeconds;
         bool triedFallback;
+        ProcessJob job;
 
         public bool Running { get { return proc != null && !proc.HasExited; } }
 
         public void Start(string ffmpeg, string device, int width, int height, int fps)
         {
+            Start(ffmpeg, device, width, height, fps, 0);
+        }
+
+        // maxSeconds > 0 fait sortir ffmpeg de lui-meme au bout de ce temps. C'est
+        // la facon la plus propre de rendre la camera : le processus la ferme
+        // normalement au lieu d'etre tue.
+        public void Start(string ffmpeg, string device, int width, int height, int fps, int maxSeconds)
+        {
             lastFfmpeg = ffmpeg; lastDevice = device;
             lastWidth = width; lastHeight = height; lastFps = fps;
+            lastMaxSeconds = maxSeconds;
             triedFallback = false;
             StartInternal(false);
         }
@@ -61,6 +71,7 @@ namespace WebcamControl
                 "-hide_banner -loglevel error " +
                 "-f dshow -rtbufsize 32M " + format +
                 "-i video=\"" + device + "\" " +
+                (lastMaxSeconds > 0 ? "-t " + lastMaxSeconds + " " : "") +
                 "-c:v mjpeg -q:v 6 -f mjpeg -";
             if (!fallback) args = args.Replace("-c:v mjpeg -q:v 6", "-c:v copy");
 
@@ -84,6 +95,8 @@ namespace WebcamControl
                 return;
             }
 
+            job = new ProcessJob();
+            job.Adopt(proc);
             proc.ErrorDataReceived += delegate(object s, DataReceivedEventArgs e)
             {
                 if (e.Data != null) { lock (stderr) { if (stderr.Length < 4000) stderr.AppendLine(e.Data); } }
@@ -227,11 +240,18 @@ namespace WebcamControl
                     try { p.Kill(); gone = p.WaitForExit(1500); }
                     catch { }
                 }
-                if (!gone) Log.Write("ffmpeg n'a pas pu etre arrete, la camera peut rester marquee occupee");
 
                 try { p.Dispose(); }
                 catch { }
             }
+
+            // Indispensable : le processus lance peut n'etre qu'un lanceur, et le vrai
+            // ffmpeg tourner dans un enfant qui, lui, tient la camera. Fermer le job
+            // emporte tout l'arbre. C'est sans effet si tout est deja termine.
+            ProcessJob j = job;
+            job = null;
+            if (j != null) j.Dispose();
+
             Thread t = reader;
             reader = null;
             // Le repli appelle Stop depuis le thread de lecture lui-meme : ne pas

@@ -11,6 +11,9 @@ namespace WebcamControl
         // --- etat ---
         ConfigDto cfg;
         CameraSession session;
+        string deviceName;              // conserve apres liberation de la session
+        DateTime hotUntil;              // au dela, la session est relachee
+        readonly Timer releaseTimer = new Timer();
         List<ControlDef> defs = new List<ControlDef>();
         readonly Dictionary<string, ControlRow> rows = new Dictionary<string, ControlRow>();
         Dictionary<string, ControlState> desired = new Dictionary<string, ControlState>();
@@ -33,7 +36,7 @@ namespace WebcamControl
         // --- auto-exposition logicielle ---
         readonly SoftAe softAe = new SoftAe();
         readonly Timer aeTimer = new Timer();
-        CheckBox chkAe;
+        CheckBox chkAe, chkAeIdle;
         TrackBar aeTarget;
         Label aeTargetValue, aeStatus;
         NumericUpDown aeInterval;
@@ -63,8 +66,13 @@ namespace WebcamControl
             watchdogTimer.Enabled = cfg.WatchdogEnabled;
 
             reconnectTimer.Interval = 4000;
-            reconnectTimer.Tick += delegate { if (session == null) Connect(true); };
+            reconnectTimer.Tick += delegate { if (defs.Count == 0) Connect(true); };
             reconnectTimer.Enabled = true;
+
+            // Filet : libere la camera des que la periode de manipulation est passee.
+            releaseTimer.Interval = 250;
+            releaseTimer.Tick += delegate { EndUse(); };
+            releaseTimer.Enabled = true;
 
             WireSoftAe();
             aeTimer.Interval = 1000;
@@ -299,7 +307,8 @@ namespace WebcamControl
         void WireSoftAe()
         {
             softAe.Ui = this;
-            softAe.GetSession = delegate { return EnsureSession() ? session : null; };
+            softAe.WithCamera = WithCamera;
+            softAe.CameraKnown = delegate { return defs.Count > 0; };
             softAe.GetExposureDef = delegate { return FindDef("Exposure"); };
             softAe.GetGainDef = delegate { return FindDef("Gain"); };
             softAe.PreviewRunning = delegate { return previewStream.Running; };
@@ -310,7 +319,7 @@ namespace WebcamControl
                 return previewLuma;
             };
             softAe.GetFfmpegPath = delegate { return cfg.FfmpegPath; };
-            softAe.GetDeviceName = delegate { return session != null ? session.DeviceName : cfg.Device; };
+            softAe.GetDeviceName = delegate { return !string.IsNullOrEmpty(deviceName) ? deviceName : cfg.Device; };
             softAe.Applied = OnAeApplied;
             softAe.Status = delegate(string text)
             {
@@ -371,6 +380,22 @@ namespace WebcamControl
                 "La mesure n'a lieu que lorsque la camera est libre ou que l'apercu est ouvert ;\n" +
                 "pendant une visioconference, les reglages sont figes.");
 
+            chkAeIdle = new CheckBox();
+            chkAeIdle.Text = "Mesurer aussi quand l'apercu est ferme";
+            chkAeIdle.AutoSize = true;
+            chkAeIdle.Location = new Point(96, 22);
+            chkAeIdle.CheckedChanged += delegate
+            {
+                if (suspendEvents) return;
+                softAe.Settings.MeterWhenIdle = chkAeIdle.Checked;
+            };
+            toolTip.SetToolTip(chkAeIdle,
+                "Coche : l'exposition reste juste toute la journee, mais la camera est\n" +
+                "occupee environ trois secondes par cycle de mesure. Si une application\n" +
+                "demande la camera juste a cet instant, elle se la voit refuser.\n" +
+                "Decoche : aucun risque, la mesure n'a lieu qu'avec l'apercu ouvert\n" +
+                "ou via le bouton Mesurer maintenant.");
+
             Label lt = new Label();
             lt.Text = "Luminosite visee";
             lt.AutoSize = true;
@@ -423,7 +448,7 @@ namespace WebcamControl
             aeStatus.SetBounds(14, 110, 380, 18);
             aeStatus.Text = "inactive";
 
-            box.Controls.AddRange(new Control[] { chkAe, lt, aeTarget, aeTargetValue, li, aeInterval, ls, btnAeMeasure, aeStatus });
+            box.Controls.AddRange(new Control[] { chkAe, chkAeIdle, lt, aeTarget, aeTargetValue, li, aeInterval, ls, btnAeMeasure, aeStatus });
             return box;
         }
 
@@ -435,6 +460,7 @@ namespace WebcamControl
             {
                 SoftAeDto s = softAe.Settings;
                 chkAe.Checked = s.Enabled;
+                chkAeIdle.Checked = s.MeterIdle;
                 aeTarget.Value = Math.Max(aeTarget.Minimum, Math.Min(aeTarget.Maximum, s.TargetLuma));
                 aeTargetValue.Text = aeTarget.Value.ToString();
                 aeInterval.Value = Math.Max(aeInterval.Minimum, Math.Min(aeInterval.Maximum, s.IdleIntervalSeconds));
@@ -451,7 +477,7 @@ namespace WebcamControl
             ControlRow row;
             if (rows.TryGetValue("Exposure", out row)) row.SetDriven(on);
             if (rows.TryGetValue("Gain", out row)) row.SetDriven(on);
-            if (btnLockAuto != null) btnLockAuto.Enabled = !on && session != null;
+            if (btnLockAuto != null) btnLockAuto.Enabled = !on && defs.Count > 0;
         }
 
         Button MakeButton(string text, int x, int y, int w)
@@ -517,10 +543,9 @@ namespace WebcamControl
 
         void Connect(bool silent)
         {
-            if (session != null) { session.Dispose(); session = null; }
+            ReleaseSession();
 
-            session = CameraSession.Open(cfg.Device);
-            if (session == null)
+            if (!EnsureSession())
             {
                 SetEnabled(false);
                 SetStatus("Camera introuvable (" + cfg.Device + "). Nouvelle tentative dans quelques secondes.", true);
@@ -528,10 +553,11 @@ namespace WebcamControl
             }
 
             defs = session.Discover();
+            EndUse();
             if (defs.Count == 0)
             {
                 SetEnabled(false);
-                SetStatus("La camera " + session.DeviceName + " n'expose aucun reglage UVC.", true);
+                SetStatus("La camera " + deviceName + " n'expose aucun reglage UVC.", true);
                 return;
             }
 
@@ -554,35 +580,78 @@ namespace WebcamControl
             if (cfg.Find(active) == null && cfg.Profiles.Count > 0) active = cfg.Profiles[0].Name;
             LoadProfile(active, true);
 
-            if (!silent) Log.Write("Connecte a " + session.DeviceName + ", " + defs.Count + " reglages");
-            SetStatus(session.DeviceName + " - " + defs.Count + " reglages disponibles", false);
+            EndUse();
+            if (!silent) Log.Write("Connecte a " + deviceName + ", " + defs.Count + " reglages");
+            SetStatus(deviceName + " - " + defs.Count + " reglages disponibles", false);
         }
 
-        // La session repond-elle encore ? Une lecture suffit et coute environ 1 ms.
+        // La camera repond-elle encore ? Une lecture suffit et coute environ 1 ms.
         bool SessionStillAlive()
         {
-            if (session == null || !session.IsOpen || defs.Count == 0) return false;
-            ControlState st;
-            return session.TryRead(defs[0], out st);
+            if (defs.Count == 0) return false;
+            bool ok = false;
+            WithCamera(delegate(CameraSession s)
+            {
+                ControlState st;
+                ok = s.TryRead(defs[0], out st);
+            });
+            return ok;
+        }
+
+        // Acces a la camera.
+        //
+        // Point crucial : tant qu'on tient le filtre DirectShow lie, aucune
+        // application Media Foundation - navigateur, donc Meet et Teams dans le
+        // navigateur, application Camera de Windows - ne peut ouvrir la camera.
+        // Elle affiche un ecran noir. On ouvre donc a la demande et on relache
+        // immediatement, sauf pendant que l'utilisateur manipule un curseur.
+        // Un acces bref pendant qu'une autre application filme deja est en
+        // revanche parfaitement inoffensif : mesure faite, la video ne bronche pas.
+        void WithCamera(Action<CameraSession> action)
+        {
+            if (!EnsureSession()) return;
+            try { action(session); }
+            finally { EndUse(); }
+        }
+
+        void KeepHot()
+        {
+            hotUntil = DateTime.Now.AddMilliseconds(700);
+        }
+
+        void EndUse()
+        {
+            if (DateTime.Now < hotUntil) return;
+            ReleaseSession();
+        }
+
+        void ReleaseSession()
+        {
+            if (session == null) return;
+            session.Dispose();
+            session = null;
         }
 
         bool EnsureSession()
         {
             if (session != null && session.IsOpen) return true;
-            if (session != null) { session.Dispose(); session = null; }
+            ReleaseSession();
             session = CameraSession.Open(cfg.Device);
+            if (session != null) deviceName = session.DeviceName;
             return session != null;
         }
 
         Dictionary<string, ControlState> ReadAllFromCamera()
         {
             Dictionary<string, ControlState> d = new Dictionary<string, ControlState>();
-            if (session == null) return d;
-            foreach (ControlDef def in defs)
+            WithCamera(delegate(CameraSession s)
             {
-                ControlState st;
-                if (session.TryRead(def, out st)) d[def.Key] = st;
-            }
+                foreach (ControlDef def in defs)
+                {
+                    ControlState st;
+                    if (s.TryRead(def, out st)) d[def.Key] = st;
+                }
+            });
             return d;
         }
 
@@ -656,7 +725,10 @@ namespace WebcamControl
         {
             if (suspendEvents) return;
             desired[def.Key] = state;
-            if (EnsureSession()) session.Write(def, state);
+            // L'utilisateur manipule : on garde la camera ouverte un court instant
+            // pour que le curseur reste fluide, puis on la relache.
+            KeepHot();
+            WithCamera(delegate(CameraSession s) { s.Write(def, state); });
         }
 
         void PushToUi(Dictionary<string, ControlState> states)
@@ -675,12 +747,14 @@ namespace WebcamControl
 
         void ApplyDesiredToCamera()
         {
-            if (!EnsureSession()) return;
-            foreach (ControlDef def in defs)
+            WithCamera(delegate(CameraSession s)
             {
-                ControlState st;
-                if (desired.TryGetValue(def.Key, out st)) session.Write(def, st);
-            }
+                foreach (ControlDef def in defs)
+                {
+                    ControlState st;
+                    if (desired.TryGetValue(def.Key, out st)) s.Write(def, st);
+                }
+            });
         }
 
         // ------------------------------------------------------------------ profils
@@ -782,8 +856,9 @@ namespace WebcamControl
 
         void ReadFromCamera()
         {
-            if (!EnsureSession()) { SetStatus("Camera indisponible", true); return; }
-            desired = ReadAllFromCamera();
+            Dictionary<string, ControlState> read = ReadAllFromCamera();
+            if (read.Count == 0) { SetStatus("Camera indisponible", true); return; }
+            desired = read;
             PushToUi(desired);
             SetStatus("Reglages relus depuis la camera", false);
         }
@@ -791,19 +866,24 @@ namespace WebcamControl
         // Fige chaque reglage encore en automatique sur la valeur ou il se trouve.
         void LockAutoControls()
         {
-            if (!EnsureSession()) { SetStatus("Camera indisponible", true); return; }
             int locked = 0;
-            foreach (ControlDef def in defs)
+            bool reached = false;
+            WithCamera(delegate(CameraSession s)
             {
-                if (!def.CanAuto || !def.CanManual) continue;
-                ControlState st;
-                if (!session.TryRead(def, out st)) continue;
-                if (!st.Auto) continue;
-                ControlState manual = new ControlState(st.Value, false);
-                session.Write(def, manual);
-                desired[def.Key] = manual;
-                locked++;
-            }
+                reached = true;
+                foreach (ControlDef def in defs)
+                {
+                    if (!def.CanAuto || !def.CanManual) continue;
+                    ControlState st;
+                    if (!s.TryRead(def, out st)) continue;
+                    if (!st.Auto) continue;
+                    ControlState manual = new ControlState(st.Value, false);
+                    s.Write(def, manual);
+                    desired[def.Key] = manual;
+                    locked++;
+                }
+            });
+            if (!reached) { SetStatus("Camera indisponible", true); return; }
             PushToUi(desired);
             SetStatus(locked == 0
                 ? "Aucun reglage n'etait en automatique"
@@ -841,18 +921,24 @@ namespace WebcamControl
         void RunWatchdog()
         {
             if (desired.Count == 0) return;
-            if (!EnsureSession()) { SetStatus("Camera absente, reconnexion en cours...", true); return; }
 
             int fixedCount = 0;
-            foreach (ControlDef def in defs)
+            bool reached = false;
+            WithCamera(delegate(CameraSession s)
             {
-                ControlState want;
-                if (!desired.TryGetValue(def.Key, out want)) continue;
-                ControlState actual;
-                if (!session.TryRead(def, out actual)) continue;
-                if (actual.Equals(want)) continue;
-                if (session.Write(def, want)) fixedCount++;
-            }
+                reached = true;
+                foreach (ControlDef def in defs)
+                {
+                    ControlState want;
+                    if (!desired.TryGetValue(def.Key, out want)) continue;
+                    ControlState actual;
+                    if (!s.TryRead(def, out actual)) continue;
+                    if (actual.Equals(want)) continue;
+                    if (s.Write(def, want)) fixedCount++;
+                }
+            });
+
+            if (!reached) { SetStatus("Camera absente, reconnexion en cours...", true); return; }
 
             if (fixedCount > 0)
             {
@@ -882,7 +968,7 @@ namespace WebcamControl
                 ClearPreviewImage();
                 return;
             }
-            string dev = session != null ? session.DeviceName : cfg.Device;
+            string dev = !string.IsNullOrEmpty(deviceName) ? deviceName : cfg.Device;
             previewStream.Start(cfg.FfmpegPath, dev, cfg.PreviewWidth, cfg.PreviewHeight, cfg.PreviewFps);
             btnPreview.Text = "Arreter l'apercu";
             SetStatus("Apercu demarre (" + cfg.PreviewWidth + "x" + cfg.PreviewHeight + ")", false);
@@ -1039,7 +1125,7 @@ namespace WebcamControl
                 return;
             }
             previewStream.Dispose();
-            if (session != null) session.Dispose();
+            ReleaseSession();
             if (tray != null) { tray.Visible = false; tray.Dispose(); }
             Store.Save(cfg);
             base.OnFormClosing(e);

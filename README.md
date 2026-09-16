@@ -143,6 +143,9 @@ De ces contraintes découle le fonctionnement :
   l'aperçu quand il est ouvert.
 - **Quand une autre application filme, tout est gelé.** C'est justement le
   moment où l'on veut que rien ne bouge.
+- **Aucune mesure dans les 20 secondes qui suivent la libération de la caméra.**
+  Quitter une visioconférence et en ouvrir une autre dans la foulée est courant ;
+  mesurer à cet instant refuserait la caméra à l'application suivante.
 - La vitesse s'adapte à qui regarde : rapide quand la caméra est libre puisque
   personne ne voit la correction, un cran de gain par seconde au maximum quand
   l'aperçu est ouvert, nulle pendant une visioconférence.
@@ -155,7 +158,15 @@ périphérique, ce qui reviendrait à le bloquer.
 Réglages, dans le profil : `TargetLuma` (luminosité visée, 0–255),
 `Deadband` (zone morte en dessous de laquelle on ne bouge pas),
 `GainMin` / `GainMax`, `ExposureMin` / `ExposureMax`,
-`IdleIntervalSeconds`, `LiveStepMax`, `IdleStepMax`.
+`IdleIntervalSeconds`, `LiveStepMax`, `IdleStepMax`, `MeterWhenIdle`.
+
+**Le compromis à connaître.** Une mesure occupe la caméra environ trois
+secondes. Si une application la demande exactement à cet instant, elle se la
+voit refuser — et la plupart ne réessaient pas toutes seules. Avec un cycle par
+défaut de cinq minutes, cela représente environ 1 % du temps. Décocher
+« Mesurer aussi quand l'aperçu est fermé » supprime complètement ce risque :
+la mesure n'a alors lieu que lorsque l'aperçu est ouvert ou sur demande, au prix
+d'une exposition qui ne suit plus la lumière de la pièce toute seule.
 
 Limite assumée : pendant une visioconférence longue, si la lumière de la pièce
 change beaucoup, l'exposition ne suivra pas. C'est le prix de l'absence totale
@@ -179,13 +190,28 @@ porte la caméra.
 
 ## Notes techniques
 
-- **Pas d'accès exclusif.** Lier le filtre DirectShow de la caméra n'empêche pas
-  une autre application de l'ouvrir, et réciproquement : mesuré dans les deux
-  sens avec ffmpeg en train de capturer. Les réglages restent donc modifiables
-  en pleine visioconférence.
-- **Session persistante.** Un cycle complet « lier, lire, écrire, libérer » coûte
-  21 ms. L'application garde le filtre lié pour la durée de vie du processus,
-  ce qui ramène chaque écriture à environ 1 ms et permet un curseur fluide.
+- **Ne jamais garder le filtre DirectShow lié.** C'est la règle la plus
+  importante du projet. Tant que le filtre est lié, aucune application Media
+  Foundation — navigateur, donc Google Meet et Teams web, application Caméra de
+  Windows — ne peut ouvrir la caméra : elle affiche un écran noir. Deux clients
+  DirectShow, eux, cohabitent sans problème, ce qui rend le piège facile à
+  manquer si l'on ne teste qu'avec ffmpeg. L'application ouvre donc à la demande
+  et relâche aussitôt. Un cycle complet « lier, lire, écrire, libérer » coûte
+  21 ms, et la connexion n'est maintenue que 700 ms après une action sur un
+  curseur, pour que le réglage reste fluide sous la souris.
+- **Un accès bref pendant qu'une autre application filme est inoffensif.**
+  Mesuré : lecture et écriture des propriétés pendant que l'application Caméra
+  diffuse, sans que l'image bronche. C'est ce qui permet au watchdog de
+  restaurer les réglages qu'une application vient d'écraser en s'ouvrant.
+- **ffmpeg peut être un lanceur.** Le `ffmpeg` du `PATH` est parfois un shim —
+  celui de Chocolatey, par exemple — qui démarre le vrai binaire dans un
+  processus enfant. Arrêter le processus lancé ne tue alors que le lanceur, et
+  l'enfant continue de tenir la caméra indéfiniment. Chaque capture est donc
+  placée dans un *job object* configuré en `KILL_ON_JOB_CLOSE`, ce qui emporte
+  tout l'arbre à l'arrêt et garantit qu'aucun processus de capture ne survit à
+  l'application, même si elle est tuée ou plante.
+- **Les mesures se donnent une durée limite.** `-t 4` fait sortir ffmpeg de
+  lui-même, ce qui rend la caméra proprement plutôt que par un arrêt forcé.
 - **Aperçu sans graphe de rendu.** Plutôt que de monter un graphe DirectShow avec
   `IVideoWindow` — beaucoup d'interop fragile sur des interfaces duales —
   l'aperçu demande à ffmpeg de recopier telles quelles les trames MJPEG de la
