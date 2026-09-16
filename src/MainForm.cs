@@ -30,6 +30,17 @@ namespace WebcamControl
         FlowLayoutPanel groupsHost;
         Panel framingPad;
 
+        // --- auto-exposition logicielle ---
+        readonly SoftAe softAe = new SoftAe();
+        readonly Timer aeTimer = new Timer();
+        CheckBox chkAe;
+        TrackBar aeTarget;
+        Label aeTargetValue, aeStatus;
+        NumericUpDown aeInterval;
+        Button btnAeMeasure;
+        double previewLuma = -1;
+        DateTime previewLumaAt = DateTime.MinValue;
+
         readonly PreviewStream previewStream = new PreviewStream();
         readonly Timer watchdogTimer = new Timer();
         readonly Timer reconnectTimer = new Timer();
@@ -55,11 +66,21 @@ namespace WebcamControl
             reconnectTimer.Tick += delegate { if (session == null) Connect(true); };
             reconnectTimer.Enabled = true;
 
+            WireSoftAe();
+            aeTimer.Interval = 1000;
+            aeTimer.Tick += delegate { try { softAe.Tick(); } catch (Exception ex) { Log.Write("AE: " + ex.Message); } };
+            aeTimer.Enabled = true;
+
             deviceChangeTimer.Interval = 1500;   // anti-rebond sur les notifications de branchement
             deviceChangeTimer.Tick += delegate
             {
                 deviceChangeTimer.Stop();
-                Log.Write("Changement de peripherique detecte, reconnexion");
+                // WM_DEVICECHANGE se declenche pour quantite de raisons, y compris
+                // l'ouverture de la camera par notre propre mesure. Reconnecter dans
+                // ce cas rechargerait le profil et annulerait l'auto-exposition en
+                // cours. On ne reconnecte donc que si la session est reellement morte.
+                if (SessionStillAlive()) return;
+                Log.Write("Camera perdue, reconnexion");
                 Connect(true);
             };
 
@@ -273,6 +294,166 @@ namespace WebcamControl
 
         readonly ToolTip toolTip = new ToolTip();
 
+        // ------------------------------------------------------------------ auto-exposition
+
+        void WireSoftAe()
+        {
+            softAe.Ui = this;
+            softAe.GetSession = delegate { return EnsureSession() ? session : null; };
+            softAe.GetExposureDef = delegate { return FindDef("Exposure"); };
+            softAe.GetGainDef = delegate { return FindDef("Gain"); };
+            softAe.PreviewRunning = delegate { return previewStream.Running; };
+            softAe.PreviewLuma = delegate
+            {
+                // une mesure de plus de 2 s n'est plus representative
+                if (previewLuma < 0 || (DateTime.Now - previewLumaAt).TotalSeconds > 2) return -1;
+                return previewLuma;
+            };
+            softAe.GetFfmpegPath = delegate { return cfg.FfmpegPath; };
+            softAe.GetDeviceName = delegate { return session != null ? session.DeviceName : cfg.Device; };
+            softAe.Applied = OnAeApplied;
+            softAe.Status = delegate(string text)
+            {
+                if (aeStatus != null) aeStatus.Text = text;
+            };
+            softAe.Trace = delegate(string text) { Log.Write(text); };
+        }
+
+        ControlDef FindDef(string key)
+        {
+            foreach (ControlDef d in defs) if (d.Key == key) return d;
+            return null;
+        }
+
+        // L'auto-exposition vient de corriger : on reporte son action dans l'interface
+        // et dans l'etat de reference, sinon le watchdog la defairait aussitot.
+        void OnAeApplied(int exposure, int gain)
+        {
+            desired["Gain"] = new ControlState(gain, false);
+            ControlDef e = FindDef("Exposure");
+            if (e != null) desired["Exposure"] = new ControlState(exposure, false);
+
+            suspendEvents = true;
+            try
+            {
+                ControlRow row;
+                if (rows.TryGetValue("Gain", out row)) row.SetState(desired["Gain"]);
+                if (e != null && rows.TryGetValue("Exposure", out row)) row.SetState(desired["Exposure"]);
+            }
+            finally { suspendEvents = false; }
+        }
+
+        GroupBox BuildSoftAeBox()
+        {
+            GroupBox box = new GroupBox();
+            box.Text = "Auto-exposition adoucie";
+            box.Height = 132;
+            box.Margin = new Padding(3, 3, 3, 10);
+
+            chkAe = new CheckBox();
+            chkAe.Text = "Activer";
+            chkAe.AutoSize = true;
+            chkAe.Location = new Point(14, 22);
+            chkAe.CheckedChanged += delegate
+            {
+                if (suspendEvents) return;
+                softAe.Settings.Enabled = chkAe.Checked;
+                softAe.Reset();
+                if (chkAe.Checked) { softAe.Prime(); softAe.MeasureNow(); }
+                UpdateAeDrivenRows();
+                SetStatus(chkAe.Checked
+                    ? "Auto-exposition adoucie activee : exposition et gain sont pilotes automatiquement"
+                    : "Auto-exposition adoucie desactivee", false);
+            };
+            toolTip.SetToolTip(chkAe,
+                "Maintient l'exposition et le gain en manuel, donc sans aucun saut du firmware,\n" +
+                "et corrige la luminosite par petits pas au gain.\n" +
+                "La mesure n'a lieu que lorsque la camera est libre ou que l'apercu est ouvert ;\n" +
+                "pendant une visioconference, les reglages sont figes.");
+
+            Label lt = new Label();
+            lt.Text = "Luminosite visee";
+            lt.AutoSize = true;
+            lt.Location = new Point(14, 52);
+
+            aeTarget = new TrackBar();
+            aeTarget.Minimum = 40; aeTarget.Maximum = 200;
+            aeTarget.TickStyle = TickStyle.None;
+            aeTarget.SetBounds(130, 46, 180, 30);
+            aeTarget.ValueChanged += delegate
+            {
+                if (aeTargetValue != null) aeTargetValue.Text = aeTarget.Value.ToString();
+                if (suspendEvents) return;
+                softAe.Settings.TargetLuma = aeTarget.Value;
+            };
+
+            aeTargetValue = new Label();
+            aeTargetValue.AutoSize = false;
+            aeTargetValue.TextAlign = ContentAlignment.MiddleRight;
+            aeTargetValue.SetBounds(314, 52, 40, 20);
+
+            Label li = new Label();
+            li.Text = "Remesurer toutes les";
+            li.AutoSize = true;
+            li.Location = new Point(14, 86);
+
+            aeInterval = new NumericUpDown();
+            aeInterval.Minimum = 15; aeInterval.Maximum = 3600;
+            aeInterval.Width = 62;
+            aeInterval.Location = new Point(144, 84);
+            aeInterval.ValueChanged += delegate
+            {
+                if (suspendEvents) return;
+                softAe.Settings.IdleIntervalSeconds = (int)aeInterval.Value;
+            };
+
+            Label ls = new Label();
+            ls.Text = "s";
+            ls.AutoSize = true;
+            ls.Location = new Point(210, 87);
+
+            btnAeMeasure = new Button();
+            btnAeMeasure.Text = "Mesurer maintenant";
+            btnAeMeasure.SetBounds(232, 82, 130, 26);
+            btnAeMeasure.Click += delegate { softAe.MeasureNow(); };
+
+            aeStatus = new Label();
+            aeStatus.AutoSize = false;
+            aeStatus.ForeColor = SystemColors.GrayText;
+            aeStatus.SetBounds(14, 110, 380, 18);
+            aeStatus.Text = "inactive";
+
+            box.Controls.AddRange(new Control[] { chkAe, lt, aeTarget, aeTargetValue, li, aeInterval, ls, btnAeMeasure, aeStatus });
+            return box;
+        }
+
+        void PushAeSettingsToUi()
+        {
+            if (chkAe == null) return;
+            suspendEvents = true;
+            try
+            {
+                SoftAeDto s = softAe.Settings;
+                chkAe.Checked = s.Enabled;
+                aeTarget.Value = Math.Max(aeTarget.Minimum, Math.Min(aeTarget.Maximum, s.TargetLuma));
+                aeTargetValue.Text = aeTarget.Value.ToString();
+                aeInterval.Value = Math.Max(aeInterval.Minimum, Math.Min(aeInterval.Maximum, s.IdleIntervalSeconds));
+            }
+            finally { suspendEvents = false; }
+            UpdateAeDrivenRows();
+        }
+
+        // Quand l'auto-exposition tient les commandes, ses deux curseurs deviennent
+        // des indicateurs : les laisser actifs inviterait a se battre avec elle.
+        void UpdateAeDrivenRows()
+        {
+            bool on = softAe.Settings.Enabled;
+            ControlRow row;
+            if (rows.TryGetValue("Exposure", out row)) row.SetDriven(on);
+            if (rows.TryGetValue("Gain", out row)) row.SetDriven(on);
+            if (btnLockAuto != null) btnLockAuto.Enabled = !on && session != null;
+        }
+
         Button MakeButton(string text, int x, int y, int w)
         {
             Button b = new Button();
@@ -377,6 +558,14 @@ namespace WebcamControl
             SetStatus(session.DeviceName + " - " + defs.Count + " reglages disponibles", false);
         }
 
+        // La session repond-elle encore ? Une lecture suffit et coute environ 1 ms.
+        bool SessionStillAlive()
+        {
+            if (session == null || !session.IsOpen || defs.Count == 0) return false;
+            ControlState st;
+            return session.TryRead(defs[0], out st);
+        }
+
         bool EnsureSession()
         {
             if (session != null && session.IsOpen) return true;
@@ -411,6 +600,8 @@ namespace WebcamControl
             groupsHost.SuspendLayout();
             groupsHost.Controls.Clear();
             rows.Clear();
+
+            if (FindDef("Gain") != null) groupsHost.Controls.Add(BuildSoftAeBox());
 
             string[] order = { Catalog.GroupExposure, Catalog.GroupImage, Catalog.GroupFraming };
             foreach (string group in order)
@@ -525,6 +716,12 @@ namespace WebcamControl
             PushToUi(desired);
             if (apply) ApplyDesiredToCamera();
 
+            // Les reglages d'auto-exposition font partie du profil.
+            softAe.Settings = p.EffectiveSoftAe();
+            softAe.Reset();
+            PushAeSettingsToUi();
+            if (softAe.Settings.Enabled && apply) { softAe.Prime(); softAe.MeasureNow(); }
+
             suspendEvents = true;
             try { profileBox.SelectedItem = p.Name; }
             finally { suspendEvents = false; }
@@ -537,7 +734,7 @@ namespace WebcamControl
         {
             string name = profileBox.SelectedItem as string;
             if (name == null) { NewProfile(); return; }
-            cfg.Upsert(ProfileDto.From(name, desired));
+            cfg.Upsert(ProfileDto.From(name, desired, softAe.Settings));
             Store.Save(cfg);
             SetStatus("Profil « " + name + " » enregistre", false);
         }
@@ -546,7 +743,7 @@ namespace WebcamControl
         {
             string name = Prompt.Ask(this, "Nom du nouveau profil", "Profil " + (cfg.Profiles.Count + 1));
             if (string.IsNullOrEmpty(name)) return;
-            cfg.Upsert(ProfileDto.From(name, desired));
+            cfg.Upsert(ProfileDto.From(name, desired, softAe.Settings));
             cfg.ActiveProfile = name;
             Store.Save(cfg);
             RefreshProfileList();
@@ -694,6 +891,9 @@ namespace WebcamControl
         void OnFrameReady(Bitmap bmp)
         {
             if (IsDisposed || !IsHandleCreated) { bmp.Dispose(); return; }
+            // Mesure faite ici, sur le thread de lecture : le thread interface reste libre.
+            double y = Metering.Luma(bmp);
+            if (y >= 0) { previewLuma = y; previewLumaAt = DateTime.Now; }
             try { BeginInvoke(new Action<Bitmap>(SetFrame), bmp); }
             catch { bmp.Dispose(); }
         }
@@ -876,6 +1076,7 @@ namespace WebcamControl
         readonly MainForm owner;
         readonly bool hasAuto;
         bool quiet;
+        bool driven;      // pilote par l'auto-exposition logicielle
 
         public ControlRow(ControlDef def, MainForm owner)
         {
@@ -919,9 +1120,17 @@ namespace WebcamControl
 
         bool IsAuto { get { return hasAuto && AutoBox.Checked; } }
 
+        public void SetDriven(bool value)
+        {
+            driven = value;
+            NameLabel.Text = value ? Def.Label + " (auto)" : Def.Label;
+            AutoBox.Enabled = !value && Def.CanAuto && Def.CanManual;
+            UpdateEnabled();
+        }
+
         void UpdateEnabled()
         {
-            Slider.Enabled = !IsAuto;
+            Slider.Enabled = !IsAuto && !driven;
             ValueLabel.ForeColor = Slider.Enabled ? SystemColors.ControlText : SystemColors.GrayText;
         }
 

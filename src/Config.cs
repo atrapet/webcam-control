@@ -17,12 +17,68 @@ namespace WebcamControl
     }
 
     [DataContract]
+    public class SoftAeDto
+    {
+        [DataMember(Order = 0)] public bool Enabled;
+        [DataMember(Order = 1)] public int TargetLuma;
+        [DataMember(Order = 2)] public int Deadband;
+        [DataMember(Order = 3)] public int GainMin;
+        [DataMember(Order = 4)] public int GainMax;
+        [DataMember(Order = 5)] public int ExposureMin;
+        [DataMember(Order = 6)] public int ExposureMax;
+        [DataMember(Order = 7)] public int IdleIntervalSeconds;
+        [DataMember(Order = 8)] public int LiveStepMax;
+        [DataMember(Order = 9)] public int IdleStepMax;
+
+        public static SoftAeDto Default()
+        {
+            SoftAeDto d = new SoftAeDto();
+            d.Enabled = false;
+            d.TargetLuma = 110;          // sur 255, mesure ponderee vers le centre
+            d.Deadband = 6;              // en dessous, l'oeil ne voit rien : on ne bouge pas
+            d.GainMin = 5;
+            d.GainMax = 75;              // au dela le bruit devient visible
+            d.ExposureMin = -9;
+            d.ExposureMax = -5;          // -4 et au dela saturent et font chuter la cadence
+            d.IdleIntervalSeconds = 180;
+            d.LiveStepMax = 1;           // apercu ouvert : un cran, soit environ 2 %
+            d.IdleStepMax = 8;           // personne ne regarde : on peut converger vite
+            return d;
+        }
+
+        public SoftAeDto Clone()
+        {
+            return (SoftAeDto)MemberwiseClone();
+        }
+
+        public void Sanitize()
+        {
+            if (TargetLuma < 20 || TargetLuma > 230) TargetLuma = 110;
+            if (Deadband < 1 || Deadband > 60) Deadband = 6;
+            if (GainMin < 0) GainMin = 0;
+            if (GainMax <= GainMin) { GainMin = 5; GainMax = 75; }
+            if (ExposureMax < ExposureMin) { ExposureMin = -9; ExposureMax = -5; }
+            if (IdleIntervalSeconds < 15) IdleIntervalSeconds = 180;
+            if (LiveStepMax < 1) LiveStepMax = 1;
+            if (IdleStepMax < 1) IdleStepMax = 8;
+        }
+    }
+
+    [DataContract]
     public class ProfileDto
     {
         [DataMember(Order = 0)] public string Name;
         [DataMember(Order = 1)] public List<SettingDto> Settings;
+        [DataMember(Order = 2)] public SoftAeDto SoftAe;
 
         public ProfileDto() { Settings = new List<SettingDto>(); }
+
+        public SoftAeDto EffectiveSoftAe()
+        {
+            if (SoftAe == null) return SoftAeDto.Default();
+            SoftAe.Sanitize();
+            return SoftAe;
+        }
 
         public Dictionary<string, ControlState> ToStates()
         {
@@ -35,8 +91,14 @@ namespace WebcamControl
 
         public static ProfileDto From(string name, Dictionary<string, ControlState> states)
         {
+            return From(name, states, null);
+        }
+
+        public static ProfileDto From(string name, Dictionary<string, ControlState> states, SoftAeDto softAe)
+        {
             ProfileDto p = new ProfileDto();
             p.Name = name;
+            p.SoftAe = softAe != null ? softAe.Clone() : null;
             foreach (KeyValuePair<string, ControlState> kv in states)
             {
                 SettingDto s = new SettingDto();

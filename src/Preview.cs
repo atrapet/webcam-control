@@ -22,24 +22,47 @@ namespace WebcamControl
         Process proc;
         Thread reader;
         volatile bool stopping;
+        volatile int framesEmitted;
         readonly StringBuilder stderr = new StringBuilder();
+
+        // Parametres du dernier demarrage, pour pouvoir retenter sans format impose.
+        string lastFfmpeg, lastDevice;
+        int lastWidth, lastHeight, lastFps;
+        bool triedFallback;
 
         public bool Running { get { return proc != null && !proc.HasExited; } }
 
         public void Start(string ffmpeg, string device, int width, int height, int fps)
         {
+            lastFfmpeg = ffmpeg; lastDevice = device;
+            lastWidth = width; lastHeight = height; lastFps = fps;
+            triedFallback = false;
+            StartInternal(false);
+        }
+
+        void StartInternal(bool fallback)
+        {
             Stop();
             stopping = false;
+            framesEmitted = 0;
             stderr.Length = 0;
 
+            // Un format impose que la camera refuse fait echouer l'ouverture ; le repli
+            // laisse ffmpeg choisir ce que le peripherique propose par defaut.
+            string format = fallback
+                ? ""
+                : "-vcodec mjpeg -video_size " + lastWidth + "x" + lastHeight + " -framerate " + lastFps + " ";
+
+            string ffmpeg = lastFfmpeg, device = lastDevice;
+            // stdin reste ouvert : envoyer "q" laisse ffmpeg fermer proprement la
+            // camera, ce qu'un Kill ne fait pas. Sans cela Windows garde le
+            // peripherique marque comme utilise et l'auto-exposition se croit bloquee.
             string args =
-                "-hide_banner -loglevel error -nostdin " +
-                "-f dshow -rtbufsize 32M " +
-                "-vcodec mjpeg " +
-                "-video_size " + width + "x" + height + " " +
-                "-framerate " + fps + " " +
+                "-hide_banner -loglevel error " +
+                "-f dshow -rtbufsize 32M " + format +
                 "-i video=\"" + device + "\" " +
-                "-c:v copy -f mjpeg -";
+                "-c:v mjpeg -q:v 6 -f mjpeg -";
+            if (!fallback) args = args.Replace("-c:v mjpeg -q:v 6", "-c:v copy");
 
             ProcessStartInfo psi = new ProcessStartInfo();
             psi.FileName = ffmpeg;
@@ -48,6 +71,7 @@ namespace WebcamControl
             psi.CreateNoWindow = true;
             psi.RedirectStandardOutput = true;
             psi.RedirectStandardError = true;
+            psi.RedirectStandardInput = true;
 
             try
             {
@@ -125,12 +149,21 @@ namespace WebcamControl
                 if (!stopping) { Raise("lecture du flux interrompue : " + ex.Message); return; }
             }
 
-            if (!stopping)
+            if (stopping) return;
+
+            string err;
+            lock (stderr) { err = stderr.ToString().Trim(); }
+
+            // Aucune image recue : le format demande n'a probablement pas ete accepte.
+            // On retente une fois en laissant la camera imposer le sien.
+            if (framesEmitted == 0 && !triedFallback)
             {
-                string err;
-                lock (stderr) { err = stderr.ToString().Trim(); }
-                Raise(err.Length > 0 ? err : "ffmpeg s'est arrete");
+                triedFallback = true;
+                try { StartInternal(true); return; }
+                catch { }
             }
+
+            Raise(err.Length > 0 ? err : "ffmpeg s'est arrete");
         }
 
         void Emit(byte[] buf, int offset, int count)
@@ -146,6 +179,7 @@ namespace WebcamControl
                     // on recopie pour ne plus dependre du MemoryStream une fois ferme
                     copy = new Bitmap(img);
                 }
+                framesEmitted++;
                 h(copy);
             }
             catch
@@ -174,14 +208,35 @@ namespace WebcamControl
             proc = null;
             if (p != null)
             {
-                try { if (!p.HasExited) p.Kill(); }
+                bool gone = false;
+                try
+                {
+                    if (p.HasExited) gone = true;
+                    else
+                    {
+                        // Arret propre d'abord : ffmpeg quitte sur "q" et relache la camera.
+                        try { p.StandardInput.Write("q"); p.StandardInput.Flush(); }
+                        catch { }
+                        gone = p.WaitForExit(600);
+                    }
+                }
                 catch { }
+
+                if (!gone)
+                {
+                    try { p.Kill(); gone = p.WaitForExit(1500); }
+                    catch { }
+                }
+                if (!gone) Log.Write("ffmpeg n'a pas pu etre arrete, la camera peut rester marquee occupee");
+
                 try { p.Dispose(); }
                 catch { }
             }
             Thread t = reader;
             reader = null;
-            if (t != null && t.IsAlive) { try { t.Join(500); } catch { } }
+            // Le repli appelle Stop depuis le thread de lecture lui-meme : ne pas
+            // l'attendre dans ce cas, sinon il s'attend indefiniment.
+            if (t != null && t != Thread.CurrentThread && t.IsAlive) { try { t.Join(500); } catch { } }
         }
 
         public void Dispose() { Stop(); }

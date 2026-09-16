@@ -58,6 +58,9 @@ YUY2 limité à 1280x720 à 10 i/s.
 - **Verrouiller les auto** : fige d'un clic l'exposition et la balance des blancs
   sur la valeur où l'automatique les a amenées. C'est le remède à l'image qui
   pompe et aux couleurs qui virent.
+- **Auto-exposition adoucie** : une auto-exposition logicielle qui corrige au
+  gain plutôt qu'à l'exposition, donc sans les sauts du firmware. Voir la
+  section dédiée plus bas.
 - **Watchdog** : toutes les N secondes, l'application relit la caméra et
   réapplique ce qui a dérivé. Les réglages ne se perdent plus quand une
   application les écrase ou quand la caméra sort de veille.
@@ -93,6 +96,71 @@ La configuration est dans `%APPDATA%\WebcamControl\config.json`, le journal dans
 `%APPDATA%\WebcamControl\webcam-control.log`. Les deux sont lisibles et
 modifiables à la main.
 
+## Auto-exposition adoucie
+
+L'auto-exposition du firmware fait varier la luminosité par paliers visibles.
+Le mode « auto-exposition adoucie » la remplace par une boucle logicielle
+nettement plus douce. Sa conception découle entièrement de quatre mesures
+faites sur la caméra, qui valent d'être connues avant de vouloir l'améliorer.
+
+**1. L'exposition est un réglage grossier, le gain un réglage fin.**
+Balayage à luminance mesurée (YAVG, gamma, 0–255) :
+
+| Exposition (gain 20) | YAVG | | Gain (exposition −7) | YAVG |
+|---|---|---|---|---|
+| −10 | 18 | | 0 | 7 |
+| −9 | 23 | | 20 | 37 |
+| −8 | 30 | | 40 | 92 |
+| −7 | 35 | | 60 | 146 |
+| −6 | 42 | | 80 | 207 |
+| −5 | 43 (saturé) | | 100 | 226 |
+
+L'exposition n'a que six crans exploitables, espacés d'environ 20 %. Le gain
+couvre toute la plage utile en cent crans. Corriger au gain est donc environ
+trois fois plus fin à chaque pas, avec seize fois plus de paliers.
+
+**2. Le flux vidéo est exclusif.** Deux captures simultanées échouent, quelle
+que soit la résolution, et même entre une application Media Foundation et une
+application DirectShow alors que le Frame Server de Windows est actif. Il est
+donc impossible de mesurer la lumière pendant une visioconférence.
+
+**3. En mode automatique, la valeur d'exposition relue est une valeur morte.**
+Sur quatorze secondes de capture, elle ne bouge pas d'un cran, alors que la
+luminance de l'image montre que la boucle du firmware travaille. On ne peut donc
+pas non plus s'en servir de posemètre.
+
+**4. Les propriétés restent pilotables pendant qu'une autre application filme.**
+C'est ce qui permet de figer les réglages sans jamais gêner personne.
+
+De ces contraintes découle le fonctionnement :
+
+- L'exposition **et** le gain restent en manuel en permanence. Le firmware ne
+  provoque donc plus aucun saut, jamais.
+- La correction se fait au gain. L'exposition ne bouge que lorsque le gain
+  arrive en butée, et le gain est alors recentré pour que la transition reste
+  continue.
+- La mesure n'a lieu que lorsque la caméra est libre, ou depuis les images de
+  l'aperçu quand il est ouvert.
+- **Quand une autre application filme, tout est gelé.** C'est justement le
+  moment où l'on veut que rien ne bouge.
+- La vitesse s'adapte à qui regarde : rapide quand la caméra est libre puisque
+  personne ne voit la correction, un cran de gain par seconde au maximum quand
+  l'aperçu est ouvert, nulle pendant une visioconférence.
+
+Pour savoir si la caméra est libre, l'application lit le registre que Windows
+tient pour son indicateur de confidentialité
+(`CapabilityAccessManager\ConsentStore\webcam`) plutôt que d'essayer d'ouvrir le
+périphérique, ce qui reviendrait à le bloquer.
+
+Réglages, dans le profil : `TargetLuma` (luminosité visée, 0–255),
+`Deadband` (zone morte en dessous de laquelle on ne bouge pas),
+`GainMin` / `GainMax`, `ExposureMin` / `ExposureMax`,
+`IdleIntervalSeconds`, `LiveStepMax`, `IdleStepMax`.
+
+Limite assumée : pendant une visioconférence longue, si la lumière de la pièce
+change beaucoup, l'exposition ne suivra pas. C'est le prix de l'absence totale
+de saut, et le matériel ne permet pas de faire autrement.
+
 ## La vraie cause des réglages perdus
 
 Le watchdog traite le symptôme. La cause la plus fréquente est la **suspension
@@ -127,6 +195,19 @@ porte la caméra.
 - **Comparaison en mode auto.** Quand un réglage est en automatique, sa valeur lue
   dérive en permanence ; le watchdog ne compare alors que le mode, jamais la
   valeur, sinon il réécrirait sans arrêt.
+- **Arrêt de ffmpeg par « q », pas par `Kill`.** Un processus tué laisse Windows
+  croire que la caméra est encore utilisée : l'entrée du `ConsentStore` garde
+  `LastUsedTimeStop` à zéro. L'auto-exposition se croirait alors bloquée
+  indéfiniment. On envoie donc `q` sur l'entrée standard et on ne tue qu'en
+  dernier recours.
+- **Ne pas se prendre pour une autre application.** Le ffmpeg de mesure est
+  enregistré sous son propre nom dans le `ConsentStore` : sans exclusion
+  explicite, l'application se verrait elle-même comme une concurrente et
+  interromprait sa propre mesure une seconde après l'avoir lancée.
+- **`WM_DEVICECHANGE` n'est pas fiable comme signal de débranchement.** Ouvrir la
+  caméra le déclenche aussi. Avant de reconnecter, on vérifie donc par une
+  lecture que la session est réellement morte, faute de quoi chaque mesure
+  rechargerait le profil et annulerait l'auto-exposition en cours.
 
 ## Limites connues
 
