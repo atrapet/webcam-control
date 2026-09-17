@@ -22,6 +22,17 @@ if (-not (Test-Path $csc)) {
 
 if (-not (Test-Path $OutDir)) { New-Item -ItemType Directory -Path $OutDir | Out-Null }
 
+# L'icone est reconstruite depuis son code source plutot que versionnee en binaire.
+$icon = Join-Path $PSScriptRoot 'assets\app.ico'
+if (-not (Test-Path $icon)) {
+    $maker = Join-Path $OutDir 'MakeIcon.exe'
+    & $csc -nologo -target:exe "-out:$maker" -reference:System.Drawing.dll `
+        (Join-Path $PSScriptRoot 'tools\MakeIcon.cs')
+    if ($LASTEXITCODE -ne 0) { throw "Echec de la compilation du generateur d'icone" }
+    & $maker $icon
+    if ($LASTEXITCODE -ne 0) { throw "Echec de la generation de l'icone" }
+}
+
 $exe = Join-Path $OutDir 'WebcamControl.exe'
 $sources = Get-ChildItem (Join-Path $PSScriptRoot 'src') -Filter *.cs | ForEach-Object { $_.FullName }
 
@@ -39,6 +50,7 @@ $cscArgs = @(
     '-target:winexe'
     '-optimize+'
     '-platform:anycpu'
+    "-win32icon:$icon"
     "-out:$exe"
 ) + ($refs | ForEach-Object { "-reference:$_" }) + $sources
 

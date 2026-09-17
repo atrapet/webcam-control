@@ -80,6 +80,19 @@ avec le .NET Framework, présent sur toute installation de Windows.
 .\build.ps1 -Run     # compile puis lance
 ```
 
+L'icône de l'application est reconstruite par le build à partir de
+`tools\MakeIcon.cs`, plutôt que versionnée en binaire.
+
+Pour la rendre trouvable dans la recherche Windows :
+
+```powershell
+.\tools\install-shortcut.ps1          # raccourci dans le menu Démarrer
+.\tools\install-shortcut.ps1 -Tray    # démarre directement en zone de notification
+.\tools\install-shortcut.ps1 -Remove  # retire le raccourci
+```
+
+Le raccourci est créé pour l'utilisateur courant, sans droits administrateur.
+
 ## Utilisation
 
 ```
